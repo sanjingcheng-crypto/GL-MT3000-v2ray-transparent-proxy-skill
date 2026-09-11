@@ -225,4 +225,3 @@ Verify no v6 bypass: from a client, `curl -6 -s -o /dev/null -w "%{http_code}\n"
 - `references/configs.md` — full copy-pasteable config templates (`config.fixed.json`, `dnscrypt-proxy.toml`, `smartdns.conf`) with `PLACEHOLDER` tokens.
 - `scripts/xray_standalone.sh` — the iptables + startup script template (REDIRECT TCP→52345, TPROXY UDP/443→52346 with fwmark return, DNS hijack→5334, **xray supervisor loop for self-healing**, process management, correct start order).
 - `scripts/xray_watchdog.sh` — cron watchdog: if `pgrep -f 'xray run'` finds nothing, re-run `xray_standalone.sh` (second-layer safety net).
-- `companion/` — side-product home-network ops scripts from the deployment session (PC SSH setup, proxy cleanup, WiFi speed-test). Not part of the core chain; see `companion/README.md`.

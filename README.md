@@ -23,10 +23,9 @@ GL-MT3000-v2ray-transparent-proxy-skill/
 │   ├── SKILL.md                      # 技能主说明（含 frontmatter）
 │   ├── references/
 │   │   └── configs.md               # 可直接复制的配置模板（含 PLACEHOLDER）
-│   ├── scripts/
-│   │   ├── xray_standalone.sh       # iptables + 启动脚本模板（含 xray 自愈循环）
-│   │   └── xray_watchdog.sh         # cron 看门狗：每分钟检查 xray，宕了自动重建整条链路
-│   └── companion/                   # 本次会话顺带的家用网络运维脚本（非核心，详见其 README）
+│   └── scripts/
+│       ├── xray_standalone.sh       # iptables + 启动脚本模板（含 xray 自愈循环）
+│       └── xray_watchdog.sh         # cron 看门狗：每分钟检查 xray，宕了自动重建整条链路
 ├── LICENSE
 └── README.md
 ```
