@@ -1,0 +1,12 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+
+# Archives / build output
+*.zip
+*.tar.gz
+
+# Local private backups (NEVER commit real config / keys)
+*PRIVATE*
+*BACKUP*
