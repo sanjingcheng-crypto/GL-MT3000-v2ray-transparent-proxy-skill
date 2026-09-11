@@ -88,6 +88,7 @@ Re-run `/usr/bin/xray -version`, `/usr/sbin/smartdns -v`, `/usr/sbin/dnscrypt-pr
 - `xray` 1.8.x standalone binary present (NOT v2rayA-managed — stop v2rayA first).
 - `smartdns` and `dnscrypt-proxy` binaries on the router (both ship on MT3000).
 - 7 working `vless`+`reality`+`xtls-rprx-vision` outbound configs (server addr/port, uuid, reality `publicKey`, `shortId`, `spiderX`, `flow=xtls-rprx-vision`).
+- **`mux` MUST be disabled on every proxy outbound.** `mux` (multiplexing) is **incompatible with `xtls-rprx-vision` + `reality`**: with `mux.enabled: true` xray opens the reality TLS handshake with mux framing, the server rejects it (`EOF` / `read tcp ...: unknown error`) and **no outbound tunnel comes up** — it looks exactly like "all sites fail". Set `"mux": { "enabled": false }` on `proxy0..proxy6`. The GUI that generated the configs may turn mux on by default, so verify it in `config.fixed.json`.
 - A CN DNS over HTTPS endpoint reachable on :443 (AliDNS `dns.alidns.com`), since upstream **blocks Do53 (port 53) but allows :443**.
 
 ## Deployment Procedure
@@ -142,6 +143,16 @@ The watchdog checks `pgrep -f 'xray run'` every minute; if nothing matches, it r
 
 > **iptables scheme note:** `xray_standalone.sh` writes the redirect rules **inline into `PREROUTING`** (with private-range `RETURN` exceptions), not into custom chains. An earlier version referenced custom chains `XRAY_REDIRECT`/`XRAY_TPROXY`/`XRAY_DNS` that were never created, so every `-A XRAY_*` rule failed silently ("No chain/target/match by that name") and client TCP 80/443 was never redirected — the whole LAN looked "dead". The inline form is idempotent (re-run safe) and is what runs on the router today.
 
+**Layer 3 — health probe (`xray_healthcheck.sh`).** Layers 1–2 only detect a **dead** xray. In the field we hit a worse failure: xray stays *alive* but **degrades** — its connection table piles up dead `SYN_SENT`/`FIN_WAIT1` sockets, so direct (CN) throughput drops ~50× (Baidu 0.5 s → 5–9 s) yet `pgrep` still finds it, so the liveness watchdog never fires. `xray_healthcheck.sh` probes Baidu through the proxy port every minute; if the HTTP code ≠ 200 **or** latency > `THRESH_MS` (2000 ms) it `kill -9`s xray and the Layer-1 supervisor respawns a **clean** process. A 120 s cooldown prevents false kills during cold start. Install alongside Layer 2:
+
+```bash
+ssh -i KEY root@<ROUTER_LAN_IP> 'cat > /usr/bin/xray_healthcheck.sh' < ./scripts/xray_healthcheck.sh
+ssh -i KEY root@<ROUTER_LAN_IP> 'chmod +x /usr/bin/xray_healthcheck.sh'
+ssh -i KEY root@<ROUTER_LAN_IP> 'echo "* * * * * /usr/bin/xray_healthcheck.sh" | crontab -'
+```
+
+Verify: `sh /usr/bin/xray_healthcheck.sh force-kill` should drop xray and have it back within ~6 s with Baidu returning 200 in <1 s. The `xray_watchdog.sh` and `xray_healthcheck.sh` cron lines coexist; both survive reboot because `crond` is enabled.
+
 ## DNS Strategy (the part that actually breaks things)
 
 This is where most time is lost. Three layers of DNS traps:
@@ -152,7 +163,11 @@ This is where most time is lost. Three layers of DNS traps:
 2. **The overseas-IP trap (critical):** If a CN domain (e.g. `www.baidu.com`) resolves to an **overseas IP** (`103.235.46.x` / `wshifen.com`) while the routing rule `geosite:cn → direct` is active, xray forces that overseas IP out the **direct** (China) path → it hangs/times out. Two fixes, pick one:
    - Use **AliDNS** (Option A) so CN domains get real CN IPs, and keep `geosite:cn → direct`; **or**
    - Drop the domain-based `geosite:cn → direct` rule and keep only the **IP-based** `geoip:cn → direct`. Then a CN-domain-but-overseas-IP correctly falls through to the proxy (which we proved reaches global sites). Genuinely-CN-IP sites still go direct.
-3. **xray 1.8.23 on MT3000 does NOT support the native `dns` inbound** (`unknown config id: dns`). Do not fight it — keep DNS in `smartdns`/`dnscrypt-proxy`, never in xray's `dns` block.
+3. **xray 1.8.23 on MT3000 does NOT support the native `dns` *inbound* (`unknown config id: dns`)** — i.e. you cannot make xray itself a DNS *listener* (`protocol: dns` inbound). The top-level `dns` **resolution block** (servers split) is fully supported and is the recommended approach (see trap 4). Keep `smartdns`/`dnscrypt-proxy` as the client-facing resolver; do not try to replace them with an xray `dns` *inbound*.
+
+4. **The "smartdns-upstream-through-proxy" trap (domestic DNS routed overseas).** Do **NOT** put `-proxy` (or any socks/xray upstream) on smartdns's `server-https`/`server-tcp` lines. If smartdns resolves through the proxy, every CN query is answered from an **overseas exit IP**, so AliDNS returns **overseas CDN nodes** (e.g. Akamai `23.53.x`) for CN sites; the `geosite:cn→direct` rule then forces those out the dead-direct path and they **hang**, and the extra proxy round-trip adds a 10–20 s cold-query stall. Keep smartdns upstream **direct** (AliDNS `223.5.5.5` / Tencent `119.29.29.29` DoH on :443).
+
+   **Recommended DNS chain (the one running in this deployment):** xray holds a `dns` block that splits by geosite — `cn-dns` (direct `223.5.5.5`, `domains: ["geosite:cn"]`, `expectIPs: ["geoip:cn"]`) and `foreign-dns` (via `proxy0`), with `"queryStrategy": "UseIPv4"` so xray never emits AAAA. smartdns then just forwards to AliDNS/Tencent DoH **directly** (no `-proxy`) and returns real CN IPs. See `references/configs.md` for the exact blocks.
 
 ## Verification & Diagnosis Workflow
 
@@ -189,6 +204,14 @@ dig +short @127.0.0.1 -p 5334 www.baidu.com
   ```
   `curl.exe` on Windows **ignores the system proxy**, but the **browser honors it** — so a site failing in the browser but succeeding in `curl --noproxy` is the dead-proxy signature.
 
+## Recent Field Issues & Fixes (captured 2026-09-11)
+
+These three failures were hit **after the initial deployment went live**, and each is now prevented by a specific setting/script in this skill. Recorded so they are not re-debugged from scratch:
+
+1. **All outbound dead — reality handshake `EOF`.** Root cause: `mux.enabled: true` had crept onto the vless outbounds; mux is incompatible with `xtls-rprx-vision`+`reality`, so the TLS handshake fails. Fix: set `mux.enabled: false` on all `proxy0..6` and **kill the old xray process** (editing the file is not enough — the live process keeps the old config). See *Prerequisites* + *Troubleshooting Matrix*.
+2. **Domestic sites slow / hang, foreign sites fine.** Root cause: smartdns upstream was pointed **through the proxy** to query AliDNS; CN DNS then resolved via an overseas exit and returned overseas CDN nodes (`23.53.x`), which `geosite:cn→direct` forced out the dead-direct path, plus IPv6 AAAA with no v6 egress. Fix: smartdns upstream **direct** (AliDNS/Tencent DoH), add xray **DNS split** (`cn-dns` direct / `foreign-dns` via proxy) and `"queryStrategy": "UseIPv4"`. See *DNS Strategy*.
+3. **Gradual slowdown to 5–9 s after running a while, no crash.** Root cause: xray **runtime degradation** — the process stays up but its connection table fills with dead `SYN_SENT`/`FIN_WAIT1` sockets, so direct throughput drops ~50×; the old liveness-only watchdog never fired. Fix: deploy `xray_healthcheck.sh` (Layer-3 probe, kills xray when Baidu >2 s, supervisor respawns clean). See *Self-Healing & Watchdog → Layer 3*.
+
 ## Troubleshooting Matrix
 
 | Symptom | Likely cause | Fix |
@@ -200,6 +223,10 @@ dig +short @127.0.0.1 -p 5334 www.baidu.com
 | Some sites load partial / QUIC errors | UDP 443 (HTTP3) bypassing TPROXY | Ensure `iptables -t mangle` TPROXY rule for UDP dport 443 → :52346 + fwmark return route |
 | IPv6 sites bypass proxy | Client using IPv6 default route | Disable/block IPv6 on LAN or force IPv4 DNS |
 | Baidu works, Google/YouTube fail | `geosite:cn→direct` too broad / proxy down | Verify 7 outbounds up; check balancer |
+| 外网全不通，xray 日志 `EOF` / reality 握手失败 | 某条 vless 出站 `mux.enabled: true` 与 `xtls-rprx-vision`+`reality` 互斥 | 所有 proxy 出站设 `mux.enabled: false`；改完须**真杀**旧 xray 进程再重启（只改磁盘配置、内存旧进程仍是旧配置） |
+| 国内站（百度）打开慢/卡 10–20s，国外站正常 | smartdns 上游走代理查 AliDNS → 国内 DNS 绕海外 + 返回海外 CDN 节点 + IPv6 无出口失败 | smartdns 上游改**直连** AliDNS/Tencent DoH；xray 加 DNS 分流(`cn-dns` 直连/`foreign-dns` 走代理) + `queryStrategy: UseIPv4` |
+| 用一阵后整体变慢(5–9s)，但进程活着、没崩溃 | xray **运行时退化**：内部堆积死连接，旧看门狗只检活不重启 | 部署 `xray_healthcheck.sh` 健康探测(>2s 自动杀)，supervisor 自愈；干净重启即恢复 |
+| 固件升级/恢复出厂后代理失效 | ubifs overlay 的自定义部署被清空，仅留出厂配置 | 升级后按本 SKILL 重新部署 4 文件 + 装回两个 cron 看门狗；建议把"升级即重部署"记进长期记忆 |
 
 ## Environment / Tooling Gotchas
 
@@ -209,6 +236,10 @@ dig +short @127.0.0.1 -p 5334 www.baidu.com
 - **Remote PowerShell mangles unescaped double quotes** → use **single quotes** for paths and concatenate with `+` (e.g. `'--user-data-dir=' + $ud`). Avoid `"` in remote scripts.
 - **Chrome CDP over SSH is fragile** — a Chrome launched inside an SSH command is killed when that SSH session ends. Prefer `curl`/`Invoke-WebRequest` for verification; only use CDP if you keep the launching SSH session alive in background.
 - **Windows `curl.exe` ignores system proxy but the browser honors it** — the core diagnosis trap for "browser dead, curl alive".
+- **MT3000 busybox has no `pkill`** → use `pgrep -f '<pattern>'` + `kill -9`. Also `sleep 1.5` (fractional) errors on busybox → use integer `sleep 1`.
+- **Force-killing xray over the same SSH session can drop your connection** — the iptables rebuild briefly flaps the redirect and the SSH session rides the LAN via the router, so you'll see `exit 255`. Reconnect; the supervisor has already respawned xray. Expected, not a failure.
+- **Firmware upgrade / factory reset wipes the overlay.** The MT3000 rootfs is a ubifs overlay; your `/usr/bin/*` scripts, `/etc/*` configs, `/etc/rc.local` and crontab survive ordinary reboots but are **erased by a firmware upgrade or factory reset**. After either, re-deploy everything and re-install both cron watchdogs. Keep a note (e.g. in long-term memory) that "upgrade ⇒ re-deploy the MT3000 proxy".
+- **The operator PC must be on the MT3000 subnet to SSH it** (see Hardware Topology). If you switch the operator PC back to the main LAN/WiFi, `ssh root@192.168.8.1` times out — rejoin the MT3000 WiFi first.
 
 ## IPv6 Leak Prevention
 
@@ -225,3 +256,4 @@ Verify no v6 bypass: from a client, `curl -6 -s -o /dev/null -w "%{http_code}\n"
 - `references/configs.md` — full copy-pasteable config templates (`config.fixed.json`, `dnscrypt-proxy.toml`, `smartdns.conf`) with `PLACEHOLDER` tokens.
 - `scripts/xray_standalone.sh` — the iptables + startup script template (REDIRECT TCP→52345, TPROXY UDP/443→52346 with fwmark return, DNS hijack→5334, **xray supervisor loop for self-healing**, process management, correct start order).
 - `scripts/xray_watchdog.sh` — cron watchdog: if `pgrep -f 'xray run'` finds nothing, re-run `xray_standalone.sh` (second-layer safety net).
+- `scripts/xray_healthcheck.sh` — health probe (Layer 3): if Baidu via the proxy port returns ≠200 or takes >2000 ms, `kill -9` xray so the supervisor respawns a clean process. Catches **runtime degradation** that a liveness-only watchdog misses.

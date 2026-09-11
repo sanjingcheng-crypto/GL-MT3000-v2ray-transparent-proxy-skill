@@ -88,6 +88,26 @@ All `PLACEHOLDER` tokens must be replaced with real values. The structure below 
 
 > NOTE: If CN domains resolve to **overseas IPs** (Cloudflare DoH case) and `geosite:cn → direct` makes them hang, **remove the first routing rule** (`geosite:cn`) and keep only the `geoip:cn/private → direct` rule. Then overseas-resolved CN domains fall through to the proxy.
 
+> **CRITICAL additions (these are what make the deployed config actually work — they were missing from earlier drafts and caused real outages):**
+>
+> 1. **`mux` must be disabled** on every `proxyN` outbound. Add `"mux": { "enabled": false }` at the outbound root (sibling of `settings`). With `xtls-rprx-vision`+`reality`, an enabled mux makes the TLS handshake fail with `EOF` and **no tunnel comes up**.
+> 2. **DNS split + IPv4-only** — append this top-level `dns` block to the config (sibling of `inbounds`/`outbounds`/`routing`):
+> 3. **`domainStrategy`** — set `"domainStrategy": "IPOnDemand"` inside `routing`.
+
+```json
+"dns": {
+  "queryStrategy": "UseIPv4",
+  "servers": [
+    { "tag": "cn-dns", "address": "223.5.5.5", "port": 53,
+      "domains": ["geosite:cn"], "expectIPs": ["geoip:cn"], "direct": true },
+    { "tag": "foreign-dns", "address": "8.8.8.8", "port": 53,
+      "outboundTag": "proxy0" }
+  ]
+}
+```
+
+> With `queryStrategy: UseIPv4`, xray never emits AAAA — important because the MT3000 has **no IPv6 egress**, so a direct IPv6 result would fail. `cn-dns` uses AliDNS `223.5.5.5` directly (real CN IPs for `geosite:cn`); `foreign-dns` resolves through `proxy0` for everything else.
+
 ---
 
 ## 2. `/etc/dnscrypt-proxy/dnscrypt-proxy.toml` (Cloudflare DoH via xray SOCKS5)
@@ -117,12 +137,12 @@ Preferred upstream so `geosite:cn → direct` works for Baidu etc.
 bind 0.0.0.0:5334
 bind-tcp 0.0.0.0:5334
 server-https https://dns.alidns.com/dns-query -host-name dns.alidns.com
-server-tcp 223.5.5.5:53
+server-https https://119.29.29.29/dns-query -host-name dns.pub
 cache-size 1024
 log-level error
 ```
 
-> If `server-https` is unsupported in your smartdns build (1.2020.x), fall back to `dnscrypt-proxy` (above) as the sole resolver and remove the `geosite:cn → direct` rule (see NOTE in section 1). Always verify `dig +short @127.0.0.1 -p 5334 www.baidu.com` returns a **CN IP** (e.g. `111.x.x.x` / `a.shifen.com`), not `wshifen.com`.
+> **NEVER add `-proxy` (or any socks/xray upstream) to these `server-*` lines.** Routing smartdns through the proxy makes every CN DNS query answer from an overseas exit, returns overseas CDN nodes (`23.53.x`), and (with AAAA) fails because there is no IPv6 egress — domestic sites then hang 10–20 s. Keep the upstreams **direct** (they reach AliDNS/Tencent DoH on :443, which upstream allows even though Do53 is blocked). If `server-https` is unsupported in your smartdns build (1.2020.x), fall back to `dnscrypt-proxy` as the sole resolver and remove the `geosite:cn → direct` rule. Always verify `dig +short @127.0.0.1 -p 5334 www.baidu.com` returns a **CN IP** (e.g. `111.x.x.x` / `a.shifen.com`), not `wshifen.com`.
 
 ---
 

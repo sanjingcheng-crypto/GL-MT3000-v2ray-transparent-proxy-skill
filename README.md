@@ -25,7 +25,8 @@ GL-MT3000-v2ray-transparent-proxy-skill/
 │   │   └── configs.md               # 可直接复制的配置模板（含 PLACEHOLDER）
 │   └── scripts/
 │       ├── xray_standalone.sh       # iptables + 启动脚本模板（含 xray 自愈循环）
-│       └── xray_watchdog.sh         # cron 看门狗：每分钟检查 xray，宕了自动重建整条链路
+│       ├── xray_watchdog.sh         # cron 看门狗①：每分钟检查 xray，宕了自动重建整条链路
+│       └── xray_healthcheck.sh      # cron 看门狗②：健康检查，>2s 自动杀退化 xray，supervisor 自愈
 ├── LICENSE
 └── README.md
 ```
@@ -62,8 +63,18 @@ cp -r mt3000-v2ray-transparent-proxy ~/.workbuddy/skills/
 
 1. 准备 7 条可用的 `vless` + `reality` + `xtls-rprx-vision` 出站（服务器地址/端口、UUID、reality `publicKey`/`shortId`/`spiderX`）。
 2. 把 `references/configs.md` 里的 `PLACEHOLDER_*` 替换成真实值（**本仓库不含任何真实密钥**，请自行填写）。
-3. 按 `SKILL.md` 的 Deployment Procedure 推送 4 个文件到路由器并启动；DNS 用 AliDNS DoH 拿真实 CN IP，避免国内站点卡死。
+3. 按 `SKILL.md` 的 Deployment Procedure 推送文件到路由器并启动；DNS 用 AliDNS DoH **直连**（**不要走代理**）拿真实 CN IP，避免国内站点卡死。注意 `config.fixed.json` 里 7 条 vless 出站的 `mux` 必须设 `false`（与 `xtls-rprx-vision`+`reality` 互斥）。
 4. 排障时优先查**客户端自身**的 Windows 系统代理与 `HTTPS_PROXY` 环境变量——多数"全站打不开"是它的锅，不是路由器。
+
+## 自愈机制（三层）
+
+路由器上实际跑的是三层自愈，缺一不可：
+
+1. **supervisor 循环**（`xray_standalone.sh` 内 `while true`）：xray 崩溃 1 秒内重启。
+2. **cron 看门狗①**（`xray_watchdog.sh`）：每分钟查 `pgrep -f 'xray run'`，进程没了就重建整条链路（覆盖 supervisor 自身被杀的极端情况）。
+3. **健康探测②**（`xray_healthcheck.sh`）：每分钟用代理端口探百度，返回非 200 或耗时 > 2s 就 `kill -9` xray 让 supervisor 重生一个干净进程。**这一层专门抓"进程活着但连接退化、吞吐掉 50 倍"的老看门狗漏判场景。**
+
+两层 cron 都靠 `crond` 开机自启，断电重启不丢；**但固件升级 / 恢复出厂会清空 ubifs overlay，需按 SKILL.md 重新部署并装回两个 cron**。
 
 ## 安全与隐私提示
 
