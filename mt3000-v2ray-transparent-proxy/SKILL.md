@@ -102,6 +102,7 @@ Re-run `/usr/bin/xray -version`, `/usr/sbin/smartdns -v`, `/usr/sbin/dnscrypt-pr
    - `/etc/dnscrypt-proxy/dnscrypt-proxy.toml` — Cloudflare DoH via xray SOCKS5 (optional alt resolver).
    - `/etc/smartdns/smartdns.conf` — binds :5334, upstream = AliDNS DoH (gives real CN IPs).
    - `/usr/bin/xray_standalone.sh` — the startup/iptables script (make executable).
+   - `/usr/bin/xray_watchdog.sh` — second-layer watchdog: a cron job checks xray every minute and, if it is not running, re-invokes `xray_standalone.sh` (covers the case where the supervisor subshell itself dies). Copy from `scripts/xray_watchdog.sh`.
 3. **Push files without sftp** — the MT3000 has no `sftp-server`, so use stdin redirection:
    ```bash
    ssh -i KEY root@<ROUTER_LAN_IP> 'cat > /etc/smartdns/smartdns.conf' < ./smartdns.conf
@@ -117,6 +118,29 @@ Re-run `/usr/bin/xray -version`, `/usr/sbin/smartdns -v`, `/usr/sbin/dnscrypt-pr
    ssh -i KEY root@<ROUTER_LAN_IP> 'grep -q xray_standalone /etc/rc.local || sed -i "/^exit 0/i sh /usr/bin/xray_standalone.sh" /etc/rc.local; chmod +x /etc/rc.local; cat /etc/rc.local'
    ```
    Verify the line appears above `exit 0`. (On stock OpenWrt the equivalent is `/etc/rc.local`; on immortalWrt also check `/etc/rc.d/`.)
+7. **(Recommended) Install the cron watchdog** as a second safety layer — it re-runs `xray_standalone.sh` if xray is ever found not running, covering both reboots *and* mid-session crashes (xray-core 1.8.23 can panic on `SniffQUIC`). See the **Self-Healing & Watchdog** section below for the exact commands.
+
+## Self-Healing & Watchdog (production hardening)
+
+xray-core **1.8.23** on the MT3000 has a known crash: `SniffQUIC` panics and kills the xray process. When xray dies, **every LAN client loses internet** (TCP redirect points at a dead `:52345`; DNS still resolves but nothing routes). Two layers of self-healing make this self-recovering:
+
+**Layer 1 — supervisor loop (inside `xray_standalone.sh`).** xray is launched inside
+`( while true; do /usr/bin/xray run ...; sleep 1; done & )`, so it restarts within ~1s of any exit. Verified: `kill -9` on xray → full recovery in ~6s, no manual intervention.
+
+**Layer 2 — cron watchdog (`xray_watchdog.sh`).** Covers the rare case where the supervisor subshell itself is killed. Install once (survives reboot because `crond` is enabled):
+
+```bash
+ssh -i KEY root@<ROUTER_LAN_IP> 'cat > /usr/bin/xray_watchdog.sh' < ./scripts/xray_watchdog.sh
+ssh -i KEY root@<ROUTER_LAN_IP> 'chmod +x /usr/bin/xray_watchdog.sh'
+ssh -i KEY root@<ROUTER_LAN_IP> 'echo "* * * * * /usr/bin/xray_watchdog.sh" | crontab -'
+ssh -i KEY root@<ROUTER_LAN_IP> 'crontab -l'
+```
+
+The watchdog checks `pgrep -f 'xray run'` every minute; if nothing matches, it re-runs `xray_standalone.sh` (which rebuilds iptables + restarts the full chain). Combined with rc.local (step 6), the router survives both **reboot** and **runtime xray crash** with zero manual action.
+
+> Make sure `crond` is enabled (`/etc/init.d/cron enable; /etc/init.d/cron start`). On GL.iNet stock firmware crond is present; if `crontab -l` shows the line but it never fires, check that the cron service is actually running.
+
+> **iptables scheme note:** `xray_standalone.sh` writes the redirect rules **inline into `PREROUTING`** (with private-range `RETURN` exceptions), not into custom chains. An earlier version referenced custom chains `XRAY_REDIRECT`/`XRAY_TPROXY`/`XRAY_DNS` that were never created, so every `-A XRAY_*` rule failed silently ("No chain/target/match by that name") and client TCP 80/443 was never redirected — the whole LAN looked "dead". The inline form is idempotent (re-run safe) and is what runs on the router today.
 
 ## DNS Strategy (the part that actually breaks things)
 
@@ -199,4 +223,6 @@ Verify no v6 bypass: from a client, `curl -6 -s -o /dev/null -w "%{http_code}\n"
 ## Resources
 
 - `references/configs.md` — full copy-pasteable config templates (`config.fixed.json`, `dnscrypt-proxy.toml`, `smartdns.conf`) with `PLACEHOLDER` tokens.
-- `scripts/xray_standalone.sh` — the iptables + startup script template (REDIRECT TCP→52345, TPROXY UDP/443→52346 with fwmark return, DNS hijack→5334, process management, correct start order).
+- `scripts/xray_standalone.sh` — the iptables + startup script template (REDIRECT TCP→52345, TPROXY UDP/443→52346 with fwmark return, DNS hijack→5334, **xray supervisor loop for self-healing**, process management, correct start order).
+- `scripts/xray_watchdog.sh` — cron watchdog: if `pgrep -f 'xray run'` finds nothing, re-run `xray_standalone.sh` (second-layer safety net).
+- `companion/` — side-product home-network ops scripts from the deployment session (PC SSH setup, proxy cleanup, WiFi speed-test). Not part of the core chain; see `companion/README.md`.

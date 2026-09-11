@@ -11,6 +11,7 @@
 - 让 MT3000 下的手机 / 电脑 / 电视**零配置**翻越，不必在每台设备上装代理客户端。
 - 诊断"连不上网"的经典坑：**客户端自己的系统代理指向了死 IP**（最常见的"全部网站打不开"元凶，和路由器无关）、DNS `SERVFAIL`、CN 域名被解析到海外 IP 导致卡死、QUIC/HTTP3（UDP 443）绕过代理、IPv6 泄漏。
 - 给出经过实战验证的 **xray 1.8.x 独立版 + iptables REDIRECT(TCP) + TPROXY(UDP/443) + smartdns + dnscrypt/AliDNS DoH** 完整链路与启动脚本。
+- **自愈 + 看门狗**：xray 崩溃（xray-core 1.8.23 的 SniffQUIC panic）后，脚本内 `while true` 循环约 1 秒重启 xray；再叠加 cron 每分钟看门狗兜底，路由器重启或运行中崩溃均无需人工介入。
 
 > **引擎说明**：路由器上实际运行的是 **Xray-core（xray）1.8.x 独立版**，不是 v2rayN。v2rayN 是 Windows 桌面图形客户端，给终端用户在自己电脑上手动连代理用；本方案把 xray 装进 MT3000 做**全网透明网关**，客户端零配置，因此不需要 v2rayN。（也不要和 v2rayA 混淆——我们停掉它、改用 xray 独立版。）
 
@@ -22,8 +23,10 @@ GL-MT3000-v2ray-transparent-proxy-skill/
 │   ├── SKILL.md                      # 技能主说明（含 frontmatter）
 │   ├── references/
 │   │   └── configs.md               # 可直接复制的配置模板（含 PLACEHOLDER）
-│   └── scripts/
-│       └── xray_standalone.sh       # iptables + 启动脚本模板
+│   ├── scripts/
+│   │   ├── xray_standalone.sh       # iptables + 启动脚本模板（含 xray 自愈循环）
+│   │   └── xray_watchdog.sh         # cron 看门狗：每分钟检查 xray，宕了自动重建整条链路
+│   └── companion/                   # 本次会话顺带的家用网络运维脚本（非核心，详见其 README）
 ├── LICENSE
 └── README.md
 ```

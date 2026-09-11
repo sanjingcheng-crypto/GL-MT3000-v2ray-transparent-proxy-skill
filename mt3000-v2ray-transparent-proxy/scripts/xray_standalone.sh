@@ -1,67 +1,88 @@
 #!/bin/sh
-# xray_standalone.sh — MT3000 transparent proxy chain bootstrap.
-# Order: stop v2rayA -> kill stale procs -> iptables -> xray -> dnscrypt-proxy -> smartdns.
-# Reboot-safe when appended to /etc/rc.local.
+# Stop v2rayA entirely (its 2.0.5 cannot store reality pbk/sid and clobbers config/iptables)
+/etc/init.d/v2raya stop 2>/dev/null
+for PID in $(pgrep -f 'v2raya'); do kill -9 "$PID" 2>/dev/null; done
 
-set -e
+# Kill any running xray / smartdns (busybox has no pkill; use pgrep + kill)
+for PID in $(pgrep -f 'xray run'); do kill -9 "$PID" 2>/dev/null; done
+for PID in $(pgrep -f 'smartdns'); do kill -9 "$PID" 2>/dev/null; done
+for PID in $(pgrep -f 'dnscrypt-proxy'); do kill -9 "$PID" 2>/dev/null; done
+sleep 2
+if pgrep -f 'xray run' >/dev/null; then
+  for PID in $(pgrep -f 'xray run'); do kill -9 "$PID" 2>/dev/null; done
+  sleep 2
+fi
+: > /var/log/xray.log
 
-XRAY_BIN=/usr/bin/xray
-XRAY_CFG=/etc/v2raya/config.fixed.json
-DNSCRYPT_BIN=/usr/sbin/dnscrypt-proxy
-DNSCRYPT_CFG=/etc/dnscrypt-proxy/dnscrypt-proxy.toml
-SMARTDNS_BIN=/usr/sbin/smartdns
-SMARTDNS_CFG=/etc/smartdns/smartdns.conf
-
-# ---- 1. stop v2rayA and kill stale processes ----
-/etc/init.d/v2raya stop 2>/dev/null || true
-for p in xray dnscrypt-proxy smartdns; do
-  for PID in $(pgrep -f "$p"); do kill -9 "$PID" 2>/dev/null; done
+# --- TCP transparent proxy (scheme B): write directly into PREROUTING, no custom chains.
+#     Old scheme referenced custom chains TP_PRE/TP_OUT/TP_RULE that were never created,
+#     so every -A TP_* rule failed silently ("No chain/target/match by that name") and
+#     client TCP 80/443 was never redirected. Inline rules survive fw3 restart.
+# 1) Drop any leftover custom chains from a previous buggy run.
+iptables -t nat -F TP_RULE 2>/dev/null; iptables -t nat -X TP_RULE 2>/dev/null
+iptables -t nat -F TP_PRE  2>/dev/null; iptables -t nat -X TP_PRE  2>/dev/null
+iptables -t nat -F TP_OUT  2>/dev/null; iptables -t nat -X TP_OUT  2>/dev/null
+# 2) Clear previously inserted inline rules so re-run stays idempotent.
+for d in 192.168.8.0/24 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+  iptables -t nat -D PREROUTING -i br-lan -d $d -j RETURN 2>/dev/null
 done
-sleep 1
+iptables -t nat -D PREROUTING -i br-lan -m mark --mark 0x80/0x80 -j RETURN 2>/dev/null
+iptables -t nat -D PREROUTING -i br-lan -p tcp -j REDIRECT --to-ports 52345 2>/dev/null
+# 3) RETURN exceptions for private/router ranges (must precede the catch-all REDIRECT).
+iptables -t nat -I PREROUTING -i br-lan -d 192.168.8.0/24 -j RETURN
+iptables -t nat -I PREROUTING -i br-lan -d 127.0.0.0/8 -j RETURN
+iptables -t nat -I PREROUTING -i br-lan -d 10.0.0.0/8 -j RETURN
+iptables -t nat -I PREROUTING -i br-lan -d 172.16.0.0/12 -j RETURN
+iptables -t nat -I PREROUTING -i br-lan -d 192.168.0.0/16 -j RETURN
+iptables -t nat -I PREROUTING -i br-lan -d 100.64.0.0/10 -j RETURN
+iptables -t nat -I PREROUTING -i br-lan -m mark --mark 0x80/0x80 -j RETURN
+# 4) Catch-all: redirect remaining client TCP to xray transparent inbound (:52345).
+#    Appended so it sits after the RETURN/DNS rules above.
+iptables -t nat -A PREROUTING -i br-lan -p tcp -j REDIRECT --to-ports 52345
 
-# ---- 2. iptables: transparent redirect (TCP) + TPROXY (UDP/443) + DNS hijack ----
-# TCP -> xray transparent inbound 52345
-iptables -t nat -N XRAY_REDIRECT 2>/dev/null || iptables -t nat -F XRAY_REDIRECT
-iptables -t nat -A XRAY_REDIRECT -p tcp -j REDIRECT --to-ports 52345
+# DNS hijack: redirect client DNS (br-lan) to smartdns on 5334.
+# Chain: client -> smartdns :5334 (UDP/TCP) -> dnscrypt-proxy :5333 (DoH) -> xray SOCKS5 :20170 (port 443) -> Cloudflare.
+# Do53 to 1.1.1.1 is blocked upstream, so we tunnel DNS over HTTPS through the proxy.
+iptables -t nat -D PREROUTING -i br-lan -p udp --dport 53 -j REDIRECT --to-ports 5333 2>/dev/null
+iptables -t nat -D PREROUTING -i br-lan -p tcp --dport 53 -j REDIRECT --to-ports 5333 2>/dev/null
+iptables -t nat -D PREROUTING -i br-lan -p udp --dport 53 -j REDIRECT --to-ports 5334 2>/dev/null
+iptables -t nat -D PREROUTING -i br-lan -p tcp --dport 53 -j REDIRECT --to-ports 5334 2>/dev/null
+iptables -t nat -I PREROUTING 1 -i br-lan -p udp --dport 53 -j REDIRECT --to-ports 5334
+iptables -t nat -I PREROUTING 1 -i br-lan -p tcp --dport 53 -j REDIRECT --to-ports 5334
 
-# UDP/443 (QUIC/HTTP3) -> xray TPROXY inbound 52346, marked 0x1
-iptables -t mangle -N XRAY_TPROXY 2>/dev/null || iptables -t mangle -F XRAY_TPROXY
-iptables -t mangle -A XRAY_TPROXY -p udp --dport 443 -j TPROXY --on-port 52346 --tproxy-mark 0x1
+# Proxy UDP/443 (QUIC) transparently via TPROXY so Chrome's HTTP3 works end-to-end.
+iptables -t filter -D FORWARD -i br-lan -p udp --dport 443 -j REJECT 2>/dev/null
+iptables -t mangle -C PREROUTING -i br-lan -p udp --dport 443 -j TPROXY --on-port 52346 --on-ip 0.0.0.0 --tproxy-mark 0x1 2>/dev/null || \
+  iptables -t mangle -I PREROUTING 1 -i br-lan -p udp --dport 443 -j TPROXY --on-port 52346 --on-ip 0.0.0.0 --tproxy-mark 0x1
+ip rule add fwmark 0x1 table 100 2>/dev/null
+ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
 
-# return route for TPROXY-marked packets
-ip rule add fwmark 0x1 table 100 2>/dev/null || true
-ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
-
-# DNS hijack: client UDP/TCP 53 -> smartdns 5334
-iptables -t nat -N XRAY_DNS 2>/dev/null || iptables -t nat -F XRAY_DNS
-iptables -t nat -A XRAY_DNS -p udp --dport 53 -j REDIRECT --to-ports 5334
-iptables -t nat -A XRAY_DNS -p tcp --dport 53 -j REDIRECT --to-ports 5334
-
-# wire chains into PREROUTING (LAN clients); exclude router's own management if needed
-iptables -t nat -A PREROUTING -j XRAY_REDIRECT
-iptables -t nat -A PREROUTING -j XRAY_DNS
-iptables -t mangle -A PREROUTING -j XRAY_TPROXY
-
-# ---- 2b. IPv6 leak prevention ----
-# If the ISP/LAN hands out IPv6, clients may take an IPv6 default route and bypass the
-# proxy entirely (IPv4 rules above don't touch v6). Drop forwarded IPv6 so LAN clients
-# cannot escape via v6. The router's own v6 input is left intact.
+# IPv6 leak prevention: if the LAN/client gets a v6 address + default route,
+# traffic can bypass the proxy via v6. Drop forwarded IPv6 so clients cannot
+# escape. The router's own v6 input is left intact.
 ip6tables -F FORWARD 2>/dev/null || true
 ip6tables -A FORWARD -j DROP 2>/dev/null || true
 
-# ---- 3. start services in dependency order ----
-( "$XRAY_BIN" run --config="$XRAY_CFG" >/var/log/xray.log 2>&1 & )
+# Start xray under a supervisor loop so it auto-restarts on crash (e.g. the SniffQUIC
+# panic in xray-core 1.8.23). Appended (>>) instead of truncated (>) so crash traces
+# survive across restarts. The loop restarts xray within ~1s of any exit.
+( while true; do /usr/bin/xray run --config=/etc/v2raya/config.fixed.json >>/var/log/xray.log 2>&1; echo "[watchdog $(date)] xray exited, restarting in 1s" >>/var/log/xray.log; sleep 1; done & )
 sleep 4
-( "$DNSCRYPT_BIN" -config "$DNSCRYPT_CFG" >/tmp/dnscrypt.log 2>&1 & )   # optional, if using Cloudflare DoH
-sleep 1
-( "$SMARTDNS_BIN" -c "$SMARTDNS_CFG" >/tmp/smartdns.log 2>&1 & )
+
+# Start dnscrypt-proxy
+( /usr/sbin/dnscrypt-proxy -config /etc/dnscrypt-proxy/dnscrypt-proxy.toml >/tmp/dnscrypt.log 2>&1 & )
 sleep 2
 
-# ---- 4. status ----
-echo "xray:    $(pgrep -f config.fixed | head -1)"
-echo "smartdns:$(pgrep -f smartdns | head -1)"
-echo "dnscrypt:$(pgrep -f dnscrypt-proxy | head -1)"
-echo "--- listen ---"
-netstat -tlnp 2>/dev/null | grep -E '52345|52346|5333|5334|20170' || true
-echo "--- DNS test ---"
-dig +short @127.0.0.1 -p 5334 www.baidu.com 2>&1 | head -1
+# Start smartdns
+( /usr/sbin/smartdns -c /etc/smartdns/smartdns.conf >/tmp/smartdns.log 2>&1 & )
+sleep 2
+
+echo "xray pid: $(pgrep -f config.fixed | head -1)"
+echo "dnscrypt-proxy pid: $(pgrep -f dnscrypt-proxy | head -1)"
+echo "smartdns pid: $(pgrep -f smartdns | head -1)"
+echo "--- TCP redirect rule (PREROUTING) ---"
+iptables -t nat -S PREROUTING | grep -E '52345|RETURN'
+echo "--- DNS redirect ---"
+iptables -t nat -S PREROUTING | grep -E '5334|5333'
+echo "--- listen ports ---"
+netstat -tlnp 2>/dev/null | grep -E '5334|5333|52345|20170'
