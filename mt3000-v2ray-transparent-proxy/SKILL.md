@@ -1,7 +1,19 @@
 ---
 name: mt3000-v2ray-transparent-proxy
-description: Deploy and troubleshoot a GL.iNet MT3000 (or similar OpenWrt/immortalWrt router) as a transparent proxy gateway using standalone xray/v2ray, iptables REDIRECT (TCP) + TPROXY (UDP/443), smartdns UDP→TCP DNS bridge, and dnscrypt-proxy or AliDNS DoH. This skill should be used when making all WiFi clients reach the global internet through a router, or when diagnosing "cannot open websites", DNS SERVFAIL, QUIC/HTTP3 bypass, overseas-IP routing traps, or "all sites fail on a client but the router is fine" on a transparent-proxy network.
+description: Deploy and troubleshoot a GL.iNet MT3000 (or similar
+  OpenWrt/immortalWrt router) as a transparent proxy gateway using standalone
+  xray/v2ray, iptables REDIRECT (TCP) + TPROXY (UDP/443), smartdns UDP→TCP DNS
+  bridge, and dnscrypt-proxy or AliDNS DoH. This skill should be used when
+  making all WiFi clients reach the global internet through a router, or when
+  diagnosing "cannot open websites", DNS SERVFAIL, QUIC/HTTP3 bypass,
+  overseas-IP routing traps, or "all sites fail on a client but the router is
+  fine" on a transparent-proxy network. Also use it when an app (e.g. WeChat
+  视频号 / Channels) refuses to load a specific feature because it detects the
+  transparent-proxy hijack (the 443 TPROXY/REDIRECT fingerprint), or when a
+  site "plays but is slow" because foreign CDN (Akamai/CloudFront) is being
+  hijacked around the proxy instead of going direct.
 agent_created: true
+disable: false
 ---
 
 # MT3000 V2Ray Transparent Proxy
@@ -16,6 +28,7 @@ Turn a GL.iNet MT3000 (or any OpenWrt-class router with xray 1.8.x) into a **tra
 - A client "cannot open Baidu / Google / YouTube" while the router itself can.
 - DNS returns `SERVFAIL` or resolves CN domains to overseas IPs (e.g. `wshifen.com`).
 - QUIC/HTTP3 (UDP 443) bypasses the proxy and leaks.
+- An app (WeChat 视频号/Channels, etc.) "cannot display / won't load a feature" while normal browsing is fine — suspect **app-side transparent-proxy detection**, not DNS or routing.
 - "All sites fail on a client" — first suspect the **client's own proxy setting**, not the router.
 
 ## Architecture (proven working chain)
@@ -204,6 +217,72 @@ dig +short @127.0.0.1 -p 5334 www.baidu.com
   ```
   `curl.exe` on Windows **ignores the system proxy**, but the **browser honors it** — so a site failing in the browser but succeeding in `curl --noproxy` is the dead-proxy signature.
 
+### App-layer diagnosis (one app's feature fails, everything else works)
+
+When a **specific app feature** is dead (e.g. WeChat 视频号 "不能显示") but normal sites load fine,
+the failure is **upstream of the proxy route decision** — you must read what the router actually saw.
+We pinpointed the root cause on the MT3000 by reading **5 areas** (top 3 are the smoking guns):
+
+**1. conntrack — what the client actually connected to**
+```bash
+conntrack -L -s 192.168.8.136            # the client's LAN IP
+```
+- Look for `udp dpt=443` (QUIC) and whether the **reply source** is the real server or xray
+  (`sport=52345` / `sport=52346` = hijacked into the proxy).
+- `mark=0` on the reply = the packet went **direct** (bypass working); `mark=...` = went through proxy.
+- If the app **never even sends** the video/QUIC request, the app already self-suppressed → proxy-fingerprint detection.
+
+**2. iptables — is the hijack actually in place / is the bypass on top?**
+```bash
+iptables -t mangle -nvL PREROUTING        # TPROXY udp 443, plus your RETURN bypass at the TOP
+iptables -t nat    -nvL PREROUTING        # REDIRECT tcp 443, plus your RETURN bypass at the TOP
+```
+- The bypass `RETURN` rules **must be at position 1–2**, above TPROXY/REDIRECT; watch the **packet counters** climb after the app runs.
+- Wrong order (TPROXY before RETURN) silently defeats the bypass.
+
+**3. xray access log — did the traffic even leave the country?**
+Enable in `config.fixed.json` (`"log": {"access": "/tmp/xray_access.log", "loglevel": "info"}`),
+then:
+```bash
+tail -f /tmp/xray_access.log | grep 192.168.8.136
+```
+- `-> direct` vs `-> proxy0` per target IP. For a CN app, video traffic should be `direct` — if it is,
+  the "traffic went abroad" hypothesis is **dead**; the problem is the *hijack*, not the *exit*.
+
+**4. smartdns audit log — what domain/IP did the client actually resolve?**
+Enable `audit-enable yes` + `audit-file /tmp/smartdns_audit.log` in `/etc/smartdns/smartdns.conf`,
+then:
+```bash
+tail -f /tmp/smartdns_audit.log | grep 192.168.8.136
+```
+- Maps the **symptom** to concrete domains/IPs so you can build the `ipset` precisely.
+
+**5. Binary-search validation (proves the proxy is the cause, not a red herring)**
+```bash
+# pause the whole transparent hijack for the client (RETURN everything from that LAN IP)
+iptables -t mangle -I PREROUTING 1 -s 192.168.8.136 -j RETURN
+iptables -t nat    -I PREROUTING 1 -s 192.168.8.136 -j RETURN
+```
+- If the feature **immediately works** → root cause is 100% the proxy fingerprint. Remove the rules after.
+  (Do NOT "fix" it by routing the app `direct` in xray — that leaves the iptables hijack and fails.)
+
+**Also rule out (these were checked but were NOT the cause):**
+- **DNS egress**: `dig +short @127.0.0.1 -p 5334 <cn-domain>` must return a **CN** IP, not an overseas
+  CDN node — smartdns upstream must be **direct** (AliDNS/Tencent DoH), never through the proxy.
+- **MTU/MSS**: `iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-to-pmtu`
+  present (no fragmentation).
+- **Client IPv6**: a v6 default route bypasses the proxy entirely — disable v6 on the client or the LAN.
+- **Startup/persistence chain**: `/etc/rc.local`, `/etc/firewall.user`, `/etc/crontabs/root` (bypass refill),
+  and `/etc/rc.d/S99xray` (watch for a **double xray instance** if rc.local and init.d both start it).
+
+**BusyBox gotchas when reading these (the hard way):**
+- `pgrep -f '<pattern>'` **matches its own SSH command** and can kill your session — prefer `pgrep -x <name>`
+  or grab the PID from the listening port (`netstat -lntp` / `ss -lntp`). BusyBox has **no `pkill`/`nohup`**;
+  detach with `( cmd & )`.
+- `kill -HUP smartdns` **kills the process** (it is not a cache-flush signal on this build) — restart it
+  instead: `/etc/init.d/smartdns restart`.
+- `nslookup @192.168.8.1` works where `dig` may be absent; pipe through `grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}'`.
+
 ## Recent Field Issues & Fixes (captured 2026-09-11)
 
 These three failures were hit **after the initial deployment went live**, and each is now prevented by a specific setting/script in this skill. Recorded so they are not re-debugged from scratch:
@@ -211,6 +290,91 @@ These three failures were hit **after the initial deployment went live**, and ea
 1. **All outbound dead — reality handshake `EOF`.** Root cause: `mux.enabled: true` had crept onto the vless outbounds; mux is incompatible with `xtls-rprx-vision`+`reality`, so the TLS handshake fails. Fix: set `mux.enabled: false` on all `proxy0..6` and **kill the old xray process** (editing the file is not enough — the live process keeps the old config). See *Prerequisites* + *Troubleshooting Matrix*.
 2. **Domestic sites slow / hang, foreign sites fine.** Root cause: smartdns upstream was pointed **through the proxy** to query AliDNS; CN DNS then resolved via an overseas exit and returned overseas CDN nodes (`23.53.x`), which `geosite:cn→direct` forced out the dead-direct path, plus IPv6 AAAA with no v6 egress. Fix: smartdns upstream **direct** (AliDNS/Tencent DoH), add xray **DNS split** (`cn-dns` direct / `foreign-dns` via proxy) and `"queryStrategy": "UseIPv4"`. See *DNS Strategy*.
 3. **Gradual slowdown to 5–9 s after running a while, no crash.** Root cause: xray **runtime degradation** — the process stays up but its connection table fills with dead `SYN_SENT`/`FIN_WAIT1` sockets, so direct throughput drops ~50×; the old liveness-only watchdog never fired. Fix: deploy `xray_healthcheck.sh` (Layer-3 probe, kills xray when Baidu >2 s, supervisor respawns clean). See *Self-Healing & Watchdog → Layer 3*.
+4. **An app refuses a feature (WeChat 视频号 "不能显示") while all normal sites work** (hit 2026-09-16). Root cause: the transparent proxy hijacks **TCP 443 (REDIRECT→xray)** and **UDP 443 (TPROXY→xray)** plus DNS-redirect to the gateway; WeChat *probes for that proxy fingerprint* and **self-suppresses** the video channel (conntrack shows it never even sends the QUIC/video request). Fix: an **app-aware iptables bypass** (ipset + `PREROUTING` top `RETURN`) so that app's IPs go direct with the original source IP — see the new **App-Aware Bypass** section. Sub-fix for "plays but slow": foreign CDN (Akamai/CloudFront/Azure) was also being hijacked around the US proxy; add those CIDRs to a `wechat_bypass_cdn` set.
+
+## App-Aware Bypass (when an app detects the transparent proxy)
+
+Some apps (notably **WeChat 视频号 / Channels**) actively probe the network for a transparent-proxy
+hijack (TCP/UDP 443 redirected + DNS sent to the gateway) and **refuse to load a specific feature**
+when they find it — even though every normal website works fine through the proxy. This is a
+**different failure class** from the DNS/routing traps above, and the usual fixes do NOT apply:
+
+- ❌ **Wrong fix (the trap we fell into first):** routing that app's domains `direct` inside xray.
+  The connection is still **hijacked by iptables** (REDIRECT/TPROXY) before xray ever sees the
+  route decision, so the proxy fingerprint remains and the app still refuses. Changing the xray
+  *route* does not remove the iptables *hijack*.
+- ✅ **Right fix:** make iptables **return those IPs before** the REDIRECT/TPROXY rules, so the
+  traffic leaves with the client's **original source IP** and the app sees no proxy at all.
+
+### Symptoms
+- One specific in-app feature fails (video never loads / "不能显示"), but Google/YouTube/Baidu all work.
+- Normal browsing is fine on the same client.
+- conntrack while the feature is open shows the app sends only signaling (e.g. UDP 2480/2580) and
+  **zero QUIC (udp 443)** — the app suppressed the request itself, it was NOT blocked.
+
+### Confirm the root cause by binary-split (do this first)
+Pause the **entire** transparent proxy for the LAN and see if the feature recovers. If it does,
+the proxy hijack is 100% the cause:
+```bash
+# suspend: insert a top-of-PREROUTING RETURN that sends all LAN traffic direct
+iptables -t mangle -I PREROUTING 1 -i br-lan -j RETURN
+iptables -t nat   -I PREROUTING 1 -i br-lan -j RETURN
+# ... ask the user to retry the failing feature ...
+# restore:
+iptables -t mangle -D PREROUTING -i br-lan -j RETURN
+iptables -t nat   -D PREROUTING -i br-lan -j RETURN
+```
+(While suspended, overseas sites will NOT load — that is expected; you are only using this to prove
+the cause. A partial test that only returns UDP 443 is NOT enough — WeChat keys off the whole
+hijack pattern, not QUIC alone.)
+
+### Permanent fix — ipset + PREROUTING RETURN bypass
+Two ipsets and four `RETURN` rules (mangle + nat, **both** tables, inserted at the **top** of
+PREROUTING so they sit **above** the TPROXY (udp 443) and REDIRECT (tcp 443) and DNS-redirect rules):
+```bash
+ipset create wechat_bypass     hash:ip  family inet 2>/dev/null
+ipset create wechat_bypass_cdn hash:net family inet 2>/dev/null
+# mangle (covers UDP/QUIC) — RETURN must be ABOVE the TPROXY udp 443 rule
+iptables -t mangle -I PREROUTING 1 -m set --match-set wechat_bypass     dst -j RETURN
+iptables -t mangle -I PREROUTING 2 -m set --match-set wechat_bypass_cdn dst -j RETURN
+# nat (TCP)
+iptables -t nat   -I PREROUTING 1 -m set --match-set wechat_bypass     dst -j RETURN
+iptables -t nat   -I PREROUTING 2 -m set --match-set wechat_bypass_cdn dst -j RETURN
+```
+- `wechat_bypass` — the app's own domains resolved to IPs (Tencent/WeChat/视频号 signaling + CDN).
+- `wechat_bypass_cdn` — **foreign generic CDNs** (Akamai `23.x`, CloudFront `18.65.x`, Azure `4.145/4.150.x`)
+  that host the app's cover images / video *fragments*. These have CN edge nodes and should go direct;
+  if hijacked they get routed around the US proxy and the feature is **slow** even though it loads.
+  Populate with `hash:net` CIDRs (example set that worked: `23.61.202.0/24 23.206.203.0/24 23.220.71.0/24
+  23.220.68.0/24 23.53.118.0/24 23.54.155.0/24 23.55.44.0/24 23.207.194.0/24 23.197.85.0/24
+  18.65.14.0/24 4.145.79.0/24 4.150.223.0/24`). CDN IPs rotate, so refresh periodically.
+
+The full idempotent maintenance script (DNS-resolves the domains into `wechat_bypass`, flushes and
+re-fills `wechat_bypass_cdn`, inserts the RETURN rules with `-C` guards so re-runs are safe) is in
+`scripts/wechat_bypass_update.sh`. Use it as the template; adjust the `DOMAINS`/`CDN` lists per app.
+
+### Ordering is the #1 subtlety
+The `RETURN` rules MUST be at **PREROUTING position 1–2**. If the TPROXY (udp 443) or REDIRECT
+(tcp 443) rule is above them, QUIC/TCP 443 is hijacked *first* and the bypass never triggers. After
+installing, verify with `iptables -t mangle -nvL PREROUTING` / `iptables -t nat -nvL PREROUTING`
+that the two `RETURN` rules appear **above** the proxy redirect rules, and watch the packet counters
+increment on the `wechat_bypass` rules.
+
+### Make it survive reboot
+Re-apply on every boot / `fw reload` / CDN rotation:
+- `/etc/firewall.user` → re-run `wechat_bypass_update.sh` (fires on `fw reload`, which includes boot).
+- `/etc/rc.local` → run it after xray starts, then again ~40 s later (DNS must be up to resolve domains).
+- `/etc/crontabs/root` → `*/15 * * * * /usr/bin/wechat_bypass_update.sh` (CDN IPs rotate).
+- If `/etc/rc.d/S99xray` exists AND rc.local also launches xray, you get **two xray fighting for
+  :52345** — `rm /etc/rc.d/S99xray` so xray is managed solely by rc.local/`xray_standalone.sh`.
+
+### Verify the fix (conntrack proof)
+While the feature plays, on the router:
+```bash
+conntrack -L -p udp -d <app_ip> 2>/dev/null | head      # reply src = original server IP, NOT xray :52345
+conntrack -L 2>/dev/null | grep <foreign_cdn_ip>        # reply dst = WAN IP, mark=0  -> went DIRECT, not via proxy
+```
+`mark=0` + reply destination = the WAN interface IP means the packet left **direct**, bypassing xray.
 
 ## Troubleshooting Matrix
 
@@ -227,6 +391,9 @@ These three failures were hit **after the initial deployment went live**, and ea
 | 国内站（百度）打开慢/卡 10–20s，国外站正常 | smartdns 上游走代理查 AliDNS → 国内 DNS 绕海外 + 返回海外 CDN 节点 + IPv6 无出口失败 | smartdns 上游改**直连** AliDNS/Tencent DoH；xray 加 DNS 分流(`cn-dns` 直连/`foreign-dns` 走代理) + `queryStrategy: UseIPv4` |
 | 用一阵后整体变慢(5–9s)，但进程活着、没崩溃 | xray **运行时退化**：内部堆积死连接，旧看门狗只检活不重启 | 部署 `xray_healthcheck.sh` 健康探测(>2s 自动杀)，supervisor 自愈；干净重启即恢复 |
 | 固件升级/恢复出厂后代理失效 | ubifs overlay 的自定义部署被清空，仅留出厂配置 | 升级后按本 SKILL 重新部署 4 文件 + 装回两个 cron 看门狗；建议把"升级即重部署"记进长期记忆 |
+| 某 App（视频号/微信）某功能打不开，但普通网页正常 | 应用检测到透明代理特征(443 被 REDIRECT/TPROXY 劫持 + DNS 重定向网关)，主动拒载该特性 | **ipset + PREROUTING 顶部 RETURN 让该 IP 直连**（源 IP 原样）；**别**只改 xray 路由出口(无效，连接已被 iptables 劫持)。先用"暂停整网透明代理"二分验证根因 |
+| 视频能播但卡/慢 | 视频托管在 Akamai/CloudFront 等国外通用 CDN，被透明代理劫持绕美国节点 | `wechat_bypass_cdn`(hash:net) 覆盖这些 CIDR 一并 bypass；conntrack 看 `mark=0`+回复 dst=WAN IP 确认直连 |
+| 拿不准是不是代理导致的某 App 故障 | — | 二分验证：mangle+nat PREROUTING 顶部插 `RETURN all -i br-lan` 暂停整网透明代理，看 App 是否恢复；恢复即坐实根因 |
 
 ## Environment / Tooling Gotchas
 
@@ -240,6 +407,11 @@ These three failures were hit **after the initial deployment went live**, and ea
 - **Force-killing xray over the same SSH session can drop your connection** — the iptables rebuild briefly flaps the redirect and the SSH session rides the LAN via the router, so you'll see `exit 255`. Reconnect; the supervisor has already respawned xray. Expected, not a failure.
 - **Firmware upgrade / factory reset wipes the overlay.** The MT3000 rootfs is a ubifs overlay; your `/usr/bin/*` scripts, `/etc/*` configs, `/etc/rc.local` and crontab survive ordinary reboots but are **erased by a firmware upgrade or factory reset**. After either, re-deploy everything and re-install both cron watchdogs. Keep a note (e.g. in long-term memory) that "upgrade ⇒ re-deploy the MT3000 proxy".
 - **The operator PC must be on the MT3000 subnet to SSH it** (see Hardware Topology). If you switch the operator PC back to the main LAN/WiFi, `ssh root@192.168.8.1` times out — rejoin the MT3000 WiFi first.
+- **busybox `netstat -p` shows no PID** → get a process PID via `pgrep -x <exact-name>` or by matching the listening port (`netstat -lntp` / parse `/proc/net/tcp`). Do not rely on `-p`.
+- **`pgrep -f '<pattern>'` can match your own SSH session command line** → `kill`ing that PID kills your shell and drops the session (exit 127). Use `pgrep -x <exact process name>` or resolve the PID from the listening port instead of `-f`.
+- **`kill -HUP smartdns` KILLS smartdns (it is not a cache-flush signal)** → DNS goes down until you restart it. To flush the DNS cache, restart smartdns (`( /usr/sbin/smartdns -c <conf> & )`) or just wait for TTL — never `kill -HUP` it.
+- **Atomic ipset updates:** build into a temp set then `ipset swap <tmp> <real>` + `ipset destroy <tmp>` so lookups never see an empty set mid-update.
+- **mangle `PREROUTING` rule ORDER matters** — see *App-Aware Bypass*. A `RETURN` below the TPROXY/REDIRECT rule is dead.
 
 ## IPv6 Leak Prevention
 
@@ -257,3 +429,4 @@ Verify no v6 bypass: from a client, `curl -6 -s -o /dev/null -w "%{http_code}\n"
 - `scripts/xray_standalone.sh` — the iptables + startup script template (REDIRECT TCP→52345, TPROXY UDP/443→52346 with fwmark return, DNS hijack→5334, **xray supervisor loop for self-healing**, process management, correct start order).
 - `scripts/xray_watchdog.sh` — cron watchdog: if `pgrep -f 'xray run'` finds nothing, re-run `xray_standalone.sh` (second-layer safety net).
 - `scripts/xray_healthcheck.sh` — health probe (Layer 3): if Baidu via the proxy port returns ≠200 or takes >2000 ms, `kill -9` xray so the supervisor respawns a clean process. Catches **runtime degradation** that a liveness-only watchdog misses.
+- `scripts/wechat_bypass_update.sh` — app-aware bypass maintenance: resolves app/WeChat/视频号 domains into `wechat_bypass` (hash:ip) and re-fills `wechat_bypass_cdn` (hash:net, foreign CDN CIDRs), then inserts idempotent `PREROUTING` top `RETURN` rules so those IPs skip the transparent proxy. Use as the template for any app that detects the proxy.
