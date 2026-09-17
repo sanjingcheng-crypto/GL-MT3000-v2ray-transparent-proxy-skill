@@ -292,6 +292,27 @@ These three failures were hit **after the initial deployment went live**, and ea
 3. **Gradual slowdown to 5–9 s after running a while, no crash.** Root cause: xray **runtime degradation** — the process stays up but its connection table fills with dead `SYN_SENT`/`FIN_WAIT1` sockets, so direct throughput drops ~50×; the old liveness-only watchdog never fired. Fix: deploy `xray_healthcheck.sh` (Layer-3 probe, kills xray when Baidu >2 s, supervisor respawns clean). See *Self-Healing & Watchdog → Layer 3*.
 4. **An app refuses a feature (WeChat 视频号 "不能显示") while all normal sites work** (hit 2026-09-16). Root cause: the transparent proxy hijacks **TCP 443 (REDIRECT→xray)** and **UDP 443 (TPROXY→xray)** plus DNS-redirect to the gateway; WeChat *probes for that proxy fingerprint* and **self-suppresses** the video channel (conntrack shows it never even sends the QUIC/video request). Fix: an **app-aware iptables bypass** (ipset + `PREROUTING` top `RETURN`) so that app's IPs go direct with the original source IP — see the new **App-Aware Bypass** section. Sub-fix for "plays but slow": foreign CDN (Akamai/CloudFront/Azure) was also being hijacked around the US proxy; add those CIDRs to a `wechat_bypass_cdn` set.
 
+5. **Client DNS times out but the router itself resolves fine (hit 2026-09-17).** Symptom: client `nslookup 192.168.8.1` times out, yet `dig`/`curl` *on the router* (loopback, e.g. `@127.0.0.1`) resolves normally — so the router "looks healthy" but every site fails on the client. Root cause: a **stale `iptables -t nat` PREROUTING rule redirects LAN `udp/tcp dpt:53` to a port (e.g. `5334`) that no process listens on** (GL's `dnsproxy` only starts in `secure` DNS mode, not the default `auto`). All client DNS is black-holed. This is a **4th DNS trap** on top of the three in *DNS Strategy*. Fix: repoint the redirect at the live resolver — `iptables -t nat -D PREROUTING -p {tcp,udp} -i br-lan --dport 53 -j REDIRECT --to-ports 5334` then `-I PREROUTING 1 ... --to-ports 53` (dnsmasq). **Verify the redirect target actually listens**: `iptables -t nat -L PREROUTING -nv` shows the `dpt:53` REDIRECT; `netstat -tulnp | grep :<port>` must show a listener or you've found the dead port. Persist a guard in `/etc/firewall.user` so a firewall reload can't resurrect the dead rule.
+6. **ChatGPT / Cloudflare-fronted sites lag (page opens, stream stalls), proxy itself healthy (hit 2026-09-17).** Symptom: `curl -x socks5h` to chatgpt.com returns 403 (reachable, GFW not the cause), node RTT ~0.9–1.3 s (fine), router load low — but the browser stutters on every navigation/SSE stream. Root cause: those sites prefer **HTTP/3 QUIC (UDP/443)**; the transparent proxy TPROXY-tunnels UDP/443 into xray whose **VLESS+reality outbound is TCP** — reality tunneling QUIC (large, many-RTT packets) jitters, so the browser tries QUIC → stalls → falls back to H2/TCP, paying that round-trip per resource. Fix (router-wide, idempotent): `iptables -t mangle -D PREROUTING -p udp -i br-lan --dport 443 -j TPROXY --on-port 52346 --on-ip 0.0.0.0 --tproxy-mark 0x1/0xffffffff` then `-I PREROUTING 1 -p udp -i br-lan --dport 443 -j DROP` (force QUIC to fail instantly → fast H2 fallback over the stable TCP proxy path). Persist in `/etc/firewall.user`. Reversible (delete the DROP rule to restore QUIC). Lighter per-device alternative: `chrome://flags/#enable-quic` = Disabled / Firefox `network.http.http3.enabled=false`.
+
+## Backup & Restore (config + runtime baseline, sanitized off-router copy)
+
+GL's one-click *Backup* (`sysupgrade -b`) only packs what `/etc/sysupgrade.conf` lists — by default it **misses every custom file** this deployment relies on. Do this:
+
+1. **Extend `/etc/sysupgrade.conf`** with the non-standard paths so a GL backup carries them:
+   `/etc/firewall.user`, `/etc/v2raya/config.fixed.json` (+ `.monbak`), `/etc/smartdns/smartdns.conf`, `/etc/dnsproxy/`, `/root/.ssh/authorized_keys`, `/usr/bin/wechat_bypass_update.sh`.
+2. **On-router backup** (real keys stay on the router, never leave it):
+   ```bash
+   TS=$(date +%Y%m%d-%H%M); BK=/root/mt3000_backups; mkdir -p $BK
+   sysupgrade -b $BK/gl-config-$TS.tar.gz
+   iptables-save  > $BK/baseline-iptables-$TS.txt
+   ipset save     > $BK/baseline-ipset-$TS.txt
+   ps w           > $BK/baseline-ps-$TS.txt
+   netstat -tulnp > $BK/baseline-listeners-$TS.txt
+   ```
+   The runtime baselines let you `diff` against a future `iptables-save` to spot rule drift (e.g. the dead-port-5334 trap above) instantly. Restore: GL UI *System → Backup/Restore* uploads the `.tar.gz`, or `sysupgrade -r <file>`.
+3. **Off-router sanitized copy** (for diffing / DR — NO secrets): pull the tar, then redact every secret in `etc/v2raya/*.json`, `*.bak_*`, `*.monbak` **and** `config.json` — VLESS uses keys `"id"`(UUID), `"address"`(server), `"publicKey"`, `"shortId"`, `"serverName"`; `config.json` is single-line so `sed` needs `/g`; exclude `*.db`/`*.dat` binaries (corrupt + may hold config). A ready script does all of this: `mt3000_pull_sanitize.sh` (see `scripts/`). **Never commit the un-sanitized tar to GitHub.**
+
 ## App-Aware Bypass (when an app detects the transparent proxy)
 
 Some apps (notably **WeChat 视频号 / Channels**) actively probe the network for a transparent-proxy
@@ -395,9 +416,13 @@ conntrack -L 2>/dev/null | grep <foreign_cdn_ip>        # reply dst = WAN IP, ma
 | 视频能播但卡/慢 | 视频托管在 Akamai/CloudFront 等国外通用 CDN，被透明代理劫持绕美国节点 | `wechat_bypass_cdn`(hash:net) 覆盖这些 CIDR 一并 bypass；conntrack 看 `mark=0`+回复 dst=WAN IP 确认直连 |
 | 拿不准是不是代理导致的某 App 故障 | — | 二分验证：mangle+nat PREROUTING 顶部插 `RETURN all -i br-lan` 暂停整网透明代理，看 App 是否恢复；恢复即坐实根因 |
 
+| Client `nslookup 192.168.8.1` **times out**, but router loopback resolves fine | Stale `nat PREROUTING` redirects LAN `dpt:53` to a **dead/empty port** (no listener) | `iptables -t nat -L PREROUTING -nv` (find `dpt:53` REDIRECT target) + `netstat -tulnp | grep :<port>` (no listener ⇒ dead port); repoint to live dnsmasq :53 |
+| ChatGPT/Cloudflare sites open but **stream stalls/lags**, proxy itself healthy (curl=200, RTT~1s) | QUIC (UDP/443) over TPROXY→reality(TCP) jitters; browser retries QUIC then falls back H2 each time | Router-wide: `iptables -t mangle -I PREROUTING 1 -p udp -i br-lan --dport 443 -j DROP` (force H2 fallback); or disable QUIC per-browser |
+
 ## Environment / Tooling Gotchas
 
-- **No sftp on MT3000** → push files via `ssh host 'cat > file' < localfile`.
+- **No sftp on MT3000 (dropbear has no sftp subsystem)** → push files via `ssh host 'cat > file' < localfile`; **pulling is symmetric**: `ssh host 'cat <file>' > localfile` (binary-safe, no pty). `scp` fails with `sftp-server: not found` — use the `cat` channel and verify archives with `gzip -t`.
+- **Writing a script containing `$(...)` / `$var` INTO a router file must use a quoted heredoc (`<<'EOF'`)** — an unquoted `cat >> f <<EOF` lets the router shell expand `$(...)` *at write time*, leaving empty/garbled lines (e.g. a dead `TPXY=` guard inside `/etc/firewall.user`). Keep `$()` literal in the file so it expands only when the file runs.
 - **`xray -test` uses a dash** (`xray -test -config …`), not `xray test`.
 - **Bash tool blocks `powershell -Command` / `cmd /c`** for remote Windows execution → use the **PowerShell tool** with an `@'...'@` heredoc (remote shell is PowerShell). Example: `ssh -i KEY user@host @' ... '@`.
 - **Remote PowerShell mangles unescaped double quotes** → use **single quotes** for paths and concatenate with `+` (e.g. `'--user-data-dir=' + $ud`). Avoid `"` in remote scripts.
